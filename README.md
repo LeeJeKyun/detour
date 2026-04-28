@@ -2,6 +2,8 @@
 
 Windows에서 특정 `IP:PORT`로 향하는 TCP/UDP 트래픽을 다른 `IP:PORT`로 투명하게 리다이렉트하는 CLI. [WinDivert](https://github.com/basil00/WinDivert)로 커널 레벨에서 패킷을 가로채 destination NAT을 수행한다.
 
+`WinDivert.dll`과 `WinDivert64.sys`는 바이너리에 임베드되어 있으므로 **`detour.exe` 단일 파일로 배포·실행 가능**하다.
+
 ## Requirements
 
 - Windows 7+ (x64)
@@ -14,10 +16,11 @@ Windows에서 특정 `IP:PORT`로 향하는 TCP/UDP 트래픽을 다른 `IP:PORT
 go build -o detour.exe .
 ```
 
-WinDivert v2.2.2 SDK를 받아 `WinDivert.dll`과 `WinDivert64.sys`를 `detour.exe`와 같은 폴더에 배치한다.
+상용 배포용으로 크기를 줄이려면:
 
-- 다운로드: https://github.com/basil00/WinDivert/releases/tag/v2.2.2
-- `x64/WinDivert.dll`, `x64/WinDivert64.sys` 두 파일을 `detour.exe` 옆으로 복사
+```powershell
+go build -ldflags "-s -w" -o detour.exe .
+```
 
 ## Usage
 
@@ -42,6 +45,18 @@ WinDivert v2.2.2 SDK를 받아 `WinDivert.dll`과 `WinDivert64.sys`를 `detour.e
 - **reverse 핸들**: `inbound + ip.SrcAddr==TO_IP + ...SrcPort==TO_PORT` 응답 수신 → 출발지를 `FROM`으로 되돌림 → 호출 측 앱은 원래 목적지에서 응답이 온 것처럼 인식
 - 시스템 전체 프로세스에 적용 (PID 필터 없음). 한 인스턴스당 1개 규칙. 다중 규칙이 필요하면 인스턴스를 여러 개 띄운다.
 
+## Runtime layout
+
+첫 실행 시 임베드된 WinDivert 파일이 다음 경로로 추출된다 (콘텐츠 해시 기반):
+
+```
+%PROGRAMDATA%\detour\runtime-<sha256-prefix>\
+  ├── WinDivert.dll
+  └── WinDivert64.sys
+```
+
+같은 버전을 재실행하면 캐시 디렉토리를 재사용하며, 다른 버전을 빌드해 배포하면 별도 디렉토리가 생성된다.
+
 ## Limitations (v1)
 
 - IPv4만 지원 (IPv6 미지원)
@@ -50,4 +65,6 @@ WinDivert v2.2.2 SDK를 받아 `WinDivert.dll`과 `WinDivert64.sys`를 `detour.e
 
 ## License
 
-`detour` 자체는 단순한 wrapper이며, 런타임 의존성인 WinDivert는 LGPLv2 / GPLv2 듀얼 라이선스다. 배포 시 WinDivert 라이선스 동봉이 필요하다.
+`detour`는 **GPLv3** 라이선스로 배포된다. 자세한 내용은 [LICENSE](LICENSE) 참조.
+
+런타임 의존성인 [WinDivert](https://github.com/basil00/WinDivert)는 **LGPLv3 / GPLv2** 듀얼 라이선스이며, 본 프로젝트는 LGPLv3 조항을 따른다. WinDivert의 라이선스 전문은 빌드/배포 시 함께 동봉할 것 (현재 저장소 기준 `third_party/WinDivert-2.2.2-A/LICENSE`).

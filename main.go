@@ -19,6 +19,7 @@ import (
 
 	"detour/internal/admin"
 	"detour/internal/dnat"
+	"detour/internal/wdembed"
 )
 
 type endpoint struct {
@@ -96,6 +97,10 @@ func main() {
 
 	if !admin.IsElevated() {
 		log.Fatal("must run as Administrator (WinDivert driver requires elevation)")
+	}
+
+	if err := wdembed.Setup(); err != nil {
+		log.Fatalf("install WinDivert runtime: %v", err)
 	}
 
 	fwdFilter := dnat.BuildForwardFilter(from.IP, from.Port, proto)

@@ -1,14 +1,14 @@
-# Binaries
+# Build output
 /detour.exe
 *.exe~
 
-# WinDivert runtime artifacts (download separately, see README)
+# Dev-time artifacts: WinDivert SDK extract
+/third_party/
+
+# Dev-time leftovers (driver may register from old paths during testing)
 /WinDivert.dll
 /WinDivert64.sys
 /WinDivert32.sys
-
-# Third-party SDK extract
-/third_party/
 
 # Go
 /vendor/
