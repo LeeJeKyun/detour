@@ -1,0 +1,21 @@
+# Binaries
+/detour.exe
+*.exe~
+
+# WinDivert runtime artifacts (download separately, see README)
+/WinDivert.dll
+/WinDivert64.sys
+/WinDivert32.sys
+
+# Third-party SDK extract
+/third_party/
+
+# Go
+/vendor/
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
