@@ -10,7 +10,9 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sync"
 	"sync/atomic"
+	"time"
 
 	divert "github.com/imgk/divert-go"
 	"golang.org/x/sync/errgroup"
@@ -19,6 +21,13 @@ import (
 	"detour/internal/dnat"
 	"detour/internal/wdembed"
 )
+
+// forceCloseAfter caps how long we wait for WinDivertShutdown to wake a
+// blocked Recv before yanking the handle closed. WinDivert v2 has a known
+// quirk where Shutdown on an idle handle (empty queue, no incoming packets)
+// fails to abort the pending overlapped I/O — Close, by contrast, reliably
+// surfaces ERROR_INVALID_HANDLE which our runPath maps to a clean nil exit.
+const forceCloseAfter = 1 * time.Second
 
 // Rule is the redirection unit: outbound packets matching From are rewritten
 // to To. Reverse-direction src is restored so the caller never sees the
@@ -73,13 +82,20 @@ func Run(ctx context.Context, rule Rule, opts Options) error {
 	if err != nil {
 		return fmt.Errorf("open forward handle: %w", err)
 	}
-	defer fwdH.Close()
-
 	revH, err := divert.Open(revFilter, divert.LayerNetwork, 0, divert.FlagDefault)
 	if err != nil {
+		_ = fwdH.Close()
 		return fmt.Errorf("open reverse handle: %w", err)
 	}
-	defer revH.Close()
+
+	// closeOnce guards against double-Close: we may force-close from the
+	// shutdown watcher when Shutdown fails to wake Recv, and the deferred
+	// Close still runs at function exit.
+	var fwdCloseOnce, revCloseOnce sync.Once
+	closeFwd := func() { fwdCloseOnce.Do(func() { _ = fwdH.Close() }) }
+	closeRev := func() { revCloseOnce.Do(func() { _ = revH.Close() }) }
+	defer closeFwd()
+	defer closeRev()
 
 	// Use the caller-provided counters when supplied; otherwise allocate
 	// local ones. Either way Run accumulates atomically so a polling reader
@@ -124,7 +140,26 @@ func Run(ctx context.Context, rule Rule, opts Options) error {
 		}, revCount, opts.Verbose, "reverse")
 	})
 
-	werr := g.Wait()
+	// g.Wait runs in a goroutine so we can race it against a force-close
+	// timeout. If Shutdown actually wakes the Recv calls, this finishes
+	// almost immediately and the timer is never observed.
+	waitDone := make(chan error, 1)
+	go func() {
+		waitDone <- g.Wait()
+	}()
+
+	var werr error
+	select {
+	case werr = <-waitDone:
+		// Graceful drain.
+	case <-mergedTimer(ctx, forceCloseAfter):
+		if opts.Verbose {
+			log.Printf("graceful drain timed out; force-closing WinDivert handles")
+		}
+		closeFwd()
+		closeRev()
+		werr = <-waitDone
+	}
 	<-shutdownDone
 
 	if opts.OnStop != nil {
@@ -135,6 +170,23 @@ func Run(ctx context.Context, rule Rule, opts Options) error {
 		return werr
 	}
 	return nil
+}
+
+// mergedTimer returns a channel that fires after d, but only if ctx is
+// already done. Used to gate the force-close path: we only start the
+// timer once the user has actually requested cancellation.
+func mergedTimer(ctx context.Context, d time.Duration) <-chan time.Time {
+	out := make(chan time.Time, 1)
+	go func() {
+		<-ctx.Done()
+		t := time.NewTimer(d)
+		defer t.Stop()
+		select {
+		case v := <-t.C:
+			out <- v
+		}
+	}()
+	return out
 }
 
 // isShutdownErr matches the WinDivert error codes that legitimately surface
