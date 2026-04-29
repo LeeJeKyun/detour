@@ -9,9 +9,24 @@ permissions:
   contents: read
 
 jobs:
+  test:
+    name: Test (cross-platform pure Go)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: go test (dnat)
+        run: go test ./internal/dnat/... -v
+
   build:
     name: Build (windows/amd64)
     runs-on: ubuntu-latest
+    needs: test
     env:
       GOOS: windows
       GOARCH: amd64
@@ -23,6 +38,12 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+
+      - name: Install go-winres
+        run: go install github.com/tc-hib/go-winres@latest
+
+      - name: Generate Windows resource (manifest + version info)
+        run: go-winres make --arch amd64
 
       - name: go vet
         run: go vet ./...

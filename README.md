@@ -13,33 +13,39 @@ A Windows CLI that transparently redirects TCP/UDP traffic destined for one `IP:
 
 - Windows 7+ (x64)
 - Go 1.23+ (build only)
-- Administrator privileges (run only — required to load the WinDivert driver)
+- Administrator privileges (run only — required to load the WinDivert driver). The binary embeds a UAC manifest, so launching it from a non-elevated shell or by double-clicking automatically triggers the elevation prompt — no need to spawn an Administrator PowerShell yourself.
 
 ## Build
 
-```powershell
-go build -o detour.exe .
+The binary embeds a UAC manifest via [`go-winres`](https://github.com/tc-hib/go-winres). One-time setup:
+
+```sh
+go install github.com/tc-hib/go-winres@latest
 ```
 
-For smaller release binaries:
+Then build:
 
 ```powershell
+go-winres make --arch amd64
 go build -ldflags "-s -w" -o detour.exe .
 ```
 
 Cross-compile from macOS/Linux:
 
 ```sh
+go-winres make --arch amd64
 GOOS=windows go build -ldflags "-s -w" -o detour.exe .
 ```
 
-## Usage
+`go-winres make` reads `winres/winres.json` and produces `rsrc_windows_amd64.syso`, which `go build` automatically links into the executable. The `.syso` file is build output (gitignored) — regenerate it whenever `winres/winres.json` changes.
 
-In an Administrator PowerShell:
+## Usage
 
 ```powershell
 .\detour.exe --from 1.2.3.4:5000 --to 127.0.0.1:5001
 ```
+
+A UAC prompt appears the first time the binary tries to load the WinDivert driver — accept it once per launch. After the prompt, the rule is active until you press `Ctrl+C`.
 
 | Flag | Description |
 |---|---|

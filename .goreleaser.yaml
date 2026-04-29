@@ -5,6 +5,8 @@ project_name: detour
 before:
   hooks:
     - go mod tidy
+    - go install github.com/tc-hib/go-winres@latest
+    - go-winres make --arch amd64
 
 builds:
   - id: detour
