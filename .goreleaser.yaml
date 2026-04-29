@@ -9,6 +9,8 @@ before:
     # GoReleaser hook은 child shell에서 실행되므로 $GITHUB_PATH 가 항상
     # 상속된다고 가정하지 않고 GOPATH/bin 절대 경로로 호출한다.
     - sh -c '"$(go env GOPATH)/bin/go-winres" make --arch amd64'
+    # 각 main 패키지 디렉토리에도 .syso 가 필요하다.
+    - sh -c 'cp rsrc_windows_amd64.syso cmd/detour-gui/'
 
 builds:
   - id: detour

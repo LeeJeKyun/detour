@@ -3,8 +3,10 @@
 /detour.exe
 *.exe~
 
-# go-winres output (regenerated from winres/winres.json on every build)
-/*.syso
+# go-winres output (regenerated from winres/winres.json on every build).
+# Both root (CLI) and cmd/detour-gui (GUI) need a copy linked into their
+# respective binaries.
+*.syso
 
 # GoReleaser output
 /dist/

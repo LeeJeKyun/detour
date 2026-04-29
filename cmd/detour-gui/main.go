@@ -27,6 +27,10 @@ func main() {
 		log.Fatalf("create main window: %v", err)
 	}
 
+	// Make the main window visible. With Create() alone walk leaves it
+	// hidden; Show() flips it visible before the message loop starts.
+	mw.Show()
+
 	// Tray icon. We don't have a custom .ico embedded yet, so fall back to
 	// running without an icon — Windows will draw a generic placeholder.
 	ni, err := walk.NewNotifyIcon(mw)
