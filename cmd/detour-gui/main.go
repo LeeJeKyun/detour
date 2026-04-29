@@ -9,6 +9,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"image"
+	"image/color"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -94,6 +96,16 @@ func main() {
 	// It's recreated on each Start and closed in onDone to halt the goroutine.
 	var tickerStop chan struct{}
 
+	// cleanupTimedOut becomes true once onStop's fallback decided to force
+	// exit. Kept as atomic so the X-button handler (GUI thread) and the
+	// fallback goroutine can race safely.
+	var cleanupTimedOut atomic.Bool
+
+	// Tray icons: one for idle, one for active. Built at runtime from solid
+	// color buffers — replace with .ico files or RT_GROUP_ICON for custom art.
+	idleIcon := makeSolidIcon(color.RGBA{R: 0x88, G: 0x88, B: 0x88, A: 0xff})   // gray
+	activeIcon := makeSolidIcon(color.RGBA{R: 0x3a, G: 0x9d, B: 0x6c, A: 0xff}) // green
+
 	// setStatus / setRunning route widget mutation onto the GUI thread.
 	// walk widgets are not goroutine-safe; Synchronize() is the official escape
 	// hatch for callbacks fired from runtime.Run's worker goroutines.
@@ -123,6 +135,15 @@ func main() {
 			toEdit.SetEnabled(!running)
 			protoCB.SetEnabled(!running)
 			stopBtn.SetEnabled(running)
+			// Tray icon swaps with running state so the user can tell at a
+			// glance (gray = idle, green = active) without opening the window.
+			if ni != nil {
+				if running && activeIcon != nil {
+					_ = ni.SetIcon(activeIcon)
+				} else if !running && idleIcon != nil {
+					_ = ni.SetIcon(idleIcon)
+				}
+			}
 			if running {
 				startBtn.SetEnabled(false)
 				return
@@ -227,6 +248,7 @@ func main() {
 		go func() {
 			time.Sleep(3 * time.Second)
 			if ctrl.isRunning() {
+				cleanupTimedOut.Store(true)
 				mw.Synchronize(func() {
 					_ = statusLb.SetText("Status: cleanup timed out — exiting")
 				})
@@ -300,23 +322,30 @@ func main() {
 		log.Fatalf("create main window: %v", err)
 	}
 
-	// X button (and Alt+F4): hide to tray instead of exiting. walk's
-	// CloseEvent always fires with CloseReasonUnknown because WM_CLOSE in
-	// form.go resets the reason before publish — so we can't filter by
-	// reason here. The tray's Quit action exits the process via
-	// walk.App().Exit(0), which doesn't go through this handler.
+	// X button (and Alt+F4) policy:
+	//   - rule actively running → hide to tray (rule keeps applying; tray
+	//     icon is the only visible affordance)
+	//   - idle (no rule running) → actually exit. Once the user has clicked
+	//     Stop and the rule is down, X means "I'm done with this app."
+	//   - cleanupTimedOut → exit immediately rather than wait the 300ms
+	//     courtesy delay in onStop's fallback.
 	//
-	// firstHide forces a one-shot balloon the first time the user closes the
-	// window so they know the app is still running in the tray. Subsequent
-	// closes are silent.
+	// walk's CloseEvent always fires with CloseReasonUnknown (WM_CLOSE in
+	// form.go resets the reason before publish), so we can't tell X from
+	// Alt+F4 from a programmatic close — same policy applies to all.
+	//
+	// firstHide forces a one-shot balloon the first time we hide so the user
+	// knows the app is still alive in the tray. Subsequent hides are silent.
 	var firstHide bool
 	mw.Closing().Attach(func(canceled *bool, _ walk.CloseReason) {
+		if !ctrl.isRunning() || cleanupTimedOut.Load() {
+			walk.App().Exit(0)
+			return
+		}
 		*canceled = true
 		mw.Hide()
 		if !firstHide {
 			firstHide = true
-			// niRef is set below after NotifyIcon is created. The closure
-			// captures it by reference via the outer ni variable.
 			if ni != nil {
 				_ = ni.ShowInfo(
 					"detour",
@@ -337,6 +366,9 @@ func main() {
 	defer ni.Dispose()
 
 	_ = ni.SetToolTip("detour")
+	if idleIcon != nil {
+		_ = ni.SetIcon(idleIcon)
+	}
 
 	// Left-click on the tray icon brings the main window back.
 	ni.MouseDown().Attach(func(_, _ int, button walk.MouseButton) {
@@ -383,4 +415,23 @@ func chosenProto(cb *walk.ComboBox) dnat.Protocol {
 	default:
 		return dnat.ProtoBoth
 	}
+}
+
+// makeSolidIcon builds a 16x16 single-color tray icon at runtime. Avoids the
+// hassle of shipping .ico files; users wanting a custom design can replace
+// the call sites with walk.NewIconFromFile / RT_GROUP_ICON later.
+func makeSolidIcon(c color.Color) *walk.Icon {
+	const size = 16
+	img := image.NewRGBA(image.Rect(0, 0, size, size))
+	for y := 0; y < size; y++ {
+		for x := 0; x < size; x++ {
+			img.Set(x, y, c)
+		}
+	}
+	icon, err := walk.NewIconFromImage(img)
+	if err != nil {
+		// On failure fall back to no icon — the tray will draw a placeholder.
+		return nil
+	}
+	return icon
 }
