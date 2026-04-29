@@ -219,6 +219,21 @@ func main() {
 		setStatus("Status: stopping...")
 		stopBtn.SetEnabled(false)
 		ctrl.stop()
+
+		// Fallback: if runtime.Run can't drain within 3s (rare WinDivert
+		// quirk where Shutdown fails to wake a blocked Recv), force the
+		// process to exit so the user is never trapped in "stopping..." with
+		// no way to recover. Same reasoning as the CLI's os.Exit fallback.
+		go func() {
+			time.Sleep(3 * time.Second)
+			if ctrl.isRunning() {
+				mw.Synchronize(func() {
+					_ = statusLb.SetText("Status: cleanup timed out — exiting")
+				})
+				time.Sleep(300 * time.Millisecond)
+				walk.App().Exit(0)
+			}
+		}()
 	}
 
 	if err := (MainWindow{

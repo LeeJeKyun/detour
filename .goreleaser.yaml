@@ -30,9 +30,29 @@ builds:
       - -X main.commit={{.Commit}}
       - -X main.date={{.Date}}
 
+  - id: detour-gui
+    main: ./cmd/detour-gui
+    binary: detour-gui
+    goos:
+      - windows
+    goarch:
+      - amd64
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    # GUI builds use windowsgui subsystem so no console window is spawned
+    # alongside the main window.
+    ldflags:
+      - -s -w -H=windowsgui
+
 archives:
   - id: detour
     formats: [zip]
+    # Bundle both binaries (CLI + GUI) into a single zip per release.
+    builds:
+      - detour
+      - detour-gui
     name_template: "detour_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
     files:
       - LICENSE

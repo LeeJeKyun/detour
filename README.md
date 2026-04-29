@@ -17,29 +17,37 @@ A Windows CLI that transparently redirects TCP/UDP traffic destined for one `IP:
 
 ## Build
 
-The binary embeds a UAC manifest via [`go-winres`](https://github.com/tc-hib/go-winres). One-time setup:
+The binaries embed a UAC manifest via [`go-winres`](https://github.com/tc-hib/go-winres). One-time setup:
 
 ```sh
 go install github.com/tc-hib/go-winres@latest
 ```
 
-Then build:
+Then build both the CLI and the GUI:
 
 ```powershell
 go-winres make --arch amd64
+Copy-Item rsrc_windows_amd64.syso cmd\detour-gui\
 go build -ldflags "-s -w" -o detour.exe .
+go build -ldflags "-s -w -H=windowsgui" -o detour-gui.exe .\cmd\detour-gui
 ```
 
 Cross-compile from macOS/Linux:
 
 ```sh
 go-winres make --arch amd64
+cp rsrc_windows_amd64.syso cmd/detour-gui/
 GOOS=windows go build -ldflags "-s -w" -o detour.exe .
+GOOS=windows go build -ldflags "-s -w -H=windowsgui" -o detour-gui.exe ./cmd/detour-gui
 ```
 
-`go-winres make` reads `winres/winres.json` and produces `rsrc_windows_amd64.syso`, which `go build` automatically links into the executable. The `.syso` file is build output (gitignored) — regenerate it whenever `winres/winres.json` changes.
+`go-winres make` reads `winres/winres.json` and produces `rsrc_windows_amd64.syso`, which `go build` automatically links into the executable. The `.syso` is build output (gitignored) — regenerate it whenever `winres/winres.json` changes. Each `main` package directory (`.` and `cmd/detour-gui/`) needs its own copy so the manifest is linked into both binaries.
+
+Released zip archives include both binaries; you can grab them from the [Releases page](../../releases) instead of building from source.
 
 ## Usage
+
+### CLI — `detour.exe`
 
 ```powershell
 .\detour.exe --from 1.2.3.4:5000 --to 127.0.0.1:5001
@@ -53,8 +61,21 @@ A UAC prompt appears the first time the binary tries to load the WinDivert drive
 | `--to <IP:PORT>` | new destination (required) |
 | `--protocol tcp\|udp\|both` | default `both` |
 | `-v` | verbose logging — prints filter expressions and drop reasons |
+| `--version` | print version and exit |
 
 Press `Ctrl+C` to stop. Both WinDivert handles close cleanly and traffic returns to its normal path.
+
+### GUI — `detour-gui.exe`
+
+A small native window for users who prefer not to keep an Administrator console open. Double-click to launch — the same UAC prompt appears, then a window with `From` / `To` / `Protocol` fields and Start / Stop buttons.
+
+Behavior:
+- **Live packet counts** (`Forward: N   Reverse: N`) refresh every second while a rule is active.
+- **Tray icon** in the system notification area — hover to see the same counts as a tooltip; left-click to reopen the window; right-click for **Open / Quit**.
+- **Closing the window** with the X button (or Alt+F4) hides to the tray instead of exiting; only **Quit** terminates the process. The first time you close, a balloon notification reminds you the app is still running.
+- Inputs are validated live; **Start** stays disabled until both `From` and `To` parse as valid IPv4:Port.
+
+The CLI and GUI share the same packet-handling core (`internal/runtime`), so behavior with respect to traffic is identical — choose whichever interface is more convenient.
 
 ## How it works
 
