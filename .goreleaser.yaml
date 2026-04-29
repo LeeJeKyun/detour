@@ -6,8 +6,9 @@ before:
   hooks:
     - go mod tidy
     # go-winres 자체는 release.yml(또는 로컬 빌드 환경)에서 사전 설치한다.
-    # PATH가 보장된 상태이므로 여기서는 호출만 한다.
-    - go-winres make --arch amd64
+    # GoReleaser hook은 child shell에서 실행되므로 $GITHUB_PATH 가 항상
+    # 상속된다고 가정하지 않고 GOPATH/bin 절대 경로로 호출한다.
+    - sh -c '"$(go env GOPATH)/bin/go-winres" make --arch amd64'
 
 builds:
   - id: detour

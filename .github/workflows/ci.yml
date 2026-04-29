@@ -39,13 +39,10 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Install go-winres
+      - name: Generate Windows resource (manifest + version info)
         run: |
           go install github.com/tc-hib/go-winres@latest
-          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
-
-      - name: Generate Windows resource (manifest + version info)
-        run: go-winres make --arch amd64
+          "$(go env GOPATH)/bin/go-winres" make --arch amd64
 
       - name: go vet
         run: go vet ./...
