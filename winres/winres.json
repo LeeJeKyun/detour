@@ -1,28 +1,7 @@
 {
-    "RT_GROUP_ICON": {},
     "RT_MANIFEST": {
         "#1": {
-            "0409": {
-                "identity": {
-                    "name": "detour",
-                    "version": "1.0.0.0"
-                },
-                "description": "Transparent TCP/UDP destination redirector for Windows",
-                "minimum-os": "win7",
-                "execution-level": "require administrator",
-                "ui-access": false,
-                "auto-elevate": false,
-                "dpi-awareness": "system",
-                "disable-theming": false,
-                "disable-window-filtering": false,
-                "high-resolution-scrolling-aware": false,
-                "ultra-high-resolution-scrolling-aware": false,
-                "long-path-aware": false,
-                "printer-driver-isolation": false,
-                "gdi-scaling": false,
-                "segment-heap": false,
-                "use-common-controls-v6": true
-            }
+            "0409": "app.manifest"
         }
     },
     "RT_VERSION": {
