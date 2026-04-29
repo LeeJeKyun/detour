@@ -45,6 +45,13 @@ type Options struct {
 	// OnStop is invoked once after both handles drain, before Run returns.
 	// Useful for surfacing packet counts in a CLI summary or GUI status bar.
 	OnStop func(Stats)
+	// ForwardCounter / ReverseCounter, when non-nil, receive every relayed
+	// packet via atomic Add. Callers can poll them concurrently for live
+	// status (e.g. a GUI that updates a label every second). The pointers
+	// must remain valid for the duration of Run. If nil, runtime keeps the
+	// counts internally and reports them only via OnStop.
+	ForwardCounter *atomic.Uint64
+	ReverseCounter *atomic.Uint64
 }
 
 // Run installs the rule, blocks until ctx is cancelled (or an unrecoverable
@@ -74,7 +81,22 @@ func Run(ctx context.Context, rule Rule, opts Options) error {
 	}
 	defer revH.Close()
 
-	var fwdCount, revCount atomic.Uint64
+	// Use the caller-provided counters when supplied; otherwise allocate
+	// local ones. Either way Run accumulates atomically so a polling reader
+	// (GUI) sees a coherent value at any time.
+	var localFwd, localRev atomic.Uint64
+	fwdCount := opts.ForwardCounter
+	if fwdCount == nil {
+		fwdCount = &localFwd
+	} else {
+		fwdCount.Store(0)
+	}
+	revCount := opts.ReverseCounter
+	if revCount == nil {
+		revCount = &localRev
+	} else {
+		revCount.Store(0)
+	}
 
 	// Watch the parent ctx directly. Driving Shutdown from outside the
 	// errgroup makes it idempotent regardless of which goroutine returns
@@ -94,12 +116,12 @@ func Run(ctx context.Context, rule Rule, opts Options) error {
 	g.Go(func() error {
 		return runPath(fwdH, func(buf []byte) error {
 			return dnat.RewriteDest(buf, rule.To.IP, rule.To.Port)
-		}, &fwdCount, opts.Verbose, "forward")
+		}, fwdCount, opts.Verbose, "forward")
 	})
 	g.Go(func() error {
 		return runPath(revH, func(buf []byte) error {
 			return dnat.RewriteSrc(buf, rule.From.IP, rule.From.Port)
-		}, &revCount, opts.Verbose, "reverse")
+		}, revCount, opts.Verbose, "reverse")
 	})
 
 	werr := g.Wait()
