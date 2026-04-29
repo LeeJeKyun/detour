@@ -9,13 +9,9 @@ permissions:
   contents: read
 
 jobs:
-  build:
-    name: Build (windows/amd64)
+  test:
+    name: Test (cross-platform pure Go)
     runs-on: ubuntu-latest
-    env:
-      GOOS: windows
-      GOARCH: amd64
-      CGO_ENABLED: "0"
     steps:
       - uses: actions/checkout@v4
 
@@ -24,8 +20,39 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      - name: go test (dnat)
+        run: go test ./internal/dnat/... -v
+
+  build:
+    name: Build (windows/amd64)
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # go-winres는 호스트(linux) 바이너리로 빌드되어야 한다.
+      # GOOS/GOARCH 를 job-level 로 두면 install 도 cross-compile 해서
+      # /home/runner/go/bin/ 에 실행 가능한 산출물이 나오지 않는다.
+      - name: Generate Windows resource (manifest + version info)
+        run: |
+          go install github.com/tc-hib/go-winres@latest
+          "$(go env GOPATH)/bin/go-winres" make --arch amd64
+
       - name: go vet
         run: go vet ./...
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: "0"
 
       - name: go build
         run: go build -trimpath -ldflags "-s -w" -o detour.exe .
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: "0"

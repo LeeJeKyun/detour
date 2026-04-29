@@ -21,6 +21,14 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      - name: Install go-winres
+        run: |
+          go install github.com/tc-hib/go-winres@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          # 동일 step에서 PATH 변경은 후속 step에만 적용되지만,
+          # GoReleaser hook은 child shell에서 실행되어 PATH 상속이 불안정할 수 있다.
+          # 안전을 위해 .goreleaser.yaml hook에서도 절대 경로로 호출한다.
+
       - uses: goreleaser/goreleaser-action@v6
         with:
           distribution: goreleaser
