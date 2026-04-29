@@ -42,6 +42,8 @@ jobs:
         run: |
           go install github.com/tc-hib/go-winres@latest
           "$(go env GOPATH)/bin/go-winres" make --arch amd64
+          # Each main package needs its own .syso next to the source.
+          cp rsrc_windows_amd64.syso cmd/detour-gui/
 
       - name: go vet
         run: go vet ./...
