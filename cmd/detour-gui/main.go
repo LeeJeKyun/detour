@@ -12,6 +12,7 @@ import (
 	"image"
 	"image/color"
 	"log"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -244,7 +245,10 @@ func main() {
 		// Fallback: if runtime.Run can't drain within 3s (rare WinDivert
 		// quirk where Shutdown fails to wake a blocked Recv), force the
 		// process to exit so the user is never trapped in "stopping..." with
-		// no way to recover. Same reasoning as the CLI's os.Exit fallback.
+		// no way to recover. Use os.Exit instead of walk.App().Exit because
+		// the latter posts WM_QUIT to the message loop — if the loop is
+		// wedged, the quit message never gets handled. os.Exit is OS-level
+		// and always terminates the process.
 		go func() {
 			time.Sleep(3 * time.Second)
 			if ctrl.isRunning() {
@@ -253,7 +257,7 @@ func main() {
 					_ = statusLb.SetText("Status: cleanup timed out — exiting")
 				})
 				time.Sleep(300 * time.Millisecond)
-				walk.App().Exit(0)
+				os.Exit(0)
 			}
 		}()
 	}
@@ -338,7 +342,12 @@ func main() {
 	// knows the app is still alive in the tray. Subsequent hides are silent.
 	var firstHide bool
 	mw.Closing().Attach(func(canceled *bool, _ walk.CloseReason) {
-		if !ctrl.isRunning() || cleanupTimedOut.Load() {
+		if cleanupTimedOut.Load() {
+			// Cleanup is already wedged — bypass walk's message loop.
+			os.Exit(0)
+		}
+		if !ctrl.isRunning() {
+			// Idle: graceful walk shutdown is fine here.
 			walk.App().Exit(0)
 			return
 		}
