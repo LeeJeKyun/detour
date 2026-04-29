@@ -1,0 +1,64 @@
+version: 2
+
+project_name: detour
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: detour
+    main: .
+    binary: detour
+    goos:
+      - windows
+    goarch:
+      - amd64
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.commit={{.Commit}}
+      - -X main.date={{.Date}}
+
+archives:
+  - id: detour
+    formats: [zip]
+    name_template: "detour_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - LICENSE
+      - README.md
+      - CHANGELOG.md
+
+checksum:
+  name_template: "checksums.txt"
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  use: github
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "^ci:"
+      - "Merge pull request"
+
+release:
+  draft: false
+  prerelease: auto
+  name_template: "v{{ .Version }}"
+  header: |
+    ## detour {{ .Tag }}
+
+    Single-file Windows binary. Run as Administrator.
+  footer: |
+    ---
+
+    **Note**: detour embeds [WinDivert](https://github.com/basil00/WinDivert) (LGPLv3 / GPLv2). The upstream WinDivert license must be included alongside any redistribution.

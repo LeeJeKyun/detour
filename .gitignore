@@ -1,6 +1,10 @@
 # Build output
+/detour
 /detour.exe
 *.exe~
+
+# GoReleaser output
+/dist/
 
 # Dev-time artifacts: WinDivert SDK extract
 /third_party/

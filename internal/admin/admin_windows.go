@@ -1,5 +1,3 @@
-//go:build windows
-
 package admin
 
 import "golang.org/x/sys/windows"

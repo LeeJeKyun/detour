@@ -1,3 +1,5 @@
+//go:build windows
+
 package main
 
 import (
@@ -11,31 +13,51 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
+
+	divert "github.com/imgk/divert-go"
+	"golang.org/x/sync/errgroup"
 
 	"detour/internal/admin"
 	"detour/internal/dnat"
-	"detour/internal/redirect"
+	"detour/internal/wdembed"
 )
 
-func parseEndpoint(s string) (redirect.Endpoint, error) {
+// Build metadata, populated at link time via -ldflags "-X main.version=...".
+var (
+	version = "dev"
+	commit  = "none"
+	date    = "unknown"
+)
+
+type endpoint struct {
+	IP   net.IP
+	Port uint16
+}
+
+func (e endpoint) String() string {
+	return net.JoinHostPort(e.IP.String(), strconv.Itoa(int(e.Port)))
+}
+
+func parseEndpoint(s string) (endpoint, error) {
 	host, portStr, err := net.SplitHostPort(s)
 	if err != nil {
-		return redirect.Endpoint{}, fmt.Errorf("invalid IP:PORT %q: %w", s, err)
+		return endpoint{}, fmt.Errorf("invalid IP:PORT %q: %w", s, err)
 	}
 	ip := net.ParseIP(host)
 	if ip == nil {
-		return redirect.Endpoint{}, fmt.Errorf("invalid IP address %q", host)
+		return endpoint{}, fmt.Errorf("invalid IP address %q", host)
 	}
 	ip = ip.To4()
 	if ip == nil {
-		return redirect.Endpoint{}, fmt.Errorf("only IPv4 supported, got %q", host)
+		return endpoint{}, fmt.Errorf("only IPv4 supported, got %q", host)
 	}
 	p, err := strconv.ParseUint(portStr, 10, 16)
 	if err != nil || p == 0 {
-		return redirect.Endpoint{}, fmt.Errorf("invalid port %q", portStr)
+		return endpoint{}, fmt.Errorf("invalid port %q", portStr)
 	}
-	return redirect.Endpoint{IP: ip, Port: uint16(p)}, nil
+	return endpoint{IP: ip, Port: uint16(p)}, nil
 }
 
 func parseProto(s string) (dnat.Protocol, error) {
@@ -54,16 +76,22 @@ func main() {
 	log.SetFlags(log.Ltime)
 
 	var (
-		fromStr  = flag.String("from", "", "intercepted destination IP:PORT (e.g. 1.2.3.4:5000)")
-		toStr    = flag.String("to", "", "redirect target IP:PORT (e.g. 127.0.0.1:5001)")
-		protoStr = flag.String("protocol", "both", "tcp|udp|both")
-		verbose  = flag.Bool("v", false, "verbose logging")
+		fromStr     = flag.String("from", "", "intercepted destination IP:PORT (e.g. 1.2.3.4:5000)")
+		toStr       = flag.String("to", "", "redirect target IP:PORT (e.g. 127.0.0.1:5001)")
+		protoStr    = flag.String("protocol", "both", "tcp|udp|both")
+		verbose     = flag.Bool("v", false, "verbose logging")
+		showVersion = flag.Bool("version", false, "print version and exit")
 	)
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: detour --from <IP:PORT> --to <IP:PORT> [--protocol tcp|udp|both]\n\n")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("detour %s (commit %s, built %s)\n", version, commit, date)
+		return
+	}
 
 	if *fromStr == "" || *toStr == "" {
 		flag.Usage()
@@ -83,27 +111,108 @@ func main() {
 	}
 
 	if !admin.IsElevated() {
-		log.Fatal("must run with elevated privileges (root on macOS/Linux, Administrator on Windows)")
+		log.Fatal("must run as Administrator (WinDivert driver requires elevation)")
 	}
 
-	rule := redirect.Rule{From: from, To: to, Proto: proto}
-	r, err := redirect.New(rule, *verbose)
-	if err != nil {
-		log.Fatalf("init redirector: %v", err)
+	if err := wdembed.Setup(); err != nil {
+		log.Fatalf("install WinDivert runtime: %v", err)
 	}
+
+	fwdFilter := dnat.BuildForwardFilter(from.IP, from.Port, proto)
+	revFilter := dnat.BuildReverseFilter(to.IP, to.Port, proto)
+	if *verbose {
+		log.Printf("forward filter: %s", fwdFilter)
+		log.Printf("reverse filter: %s", revFilter)
+	}
+
+	fwdH, err := divert.Open(fwdFilter, divert.LayerNetwork, 0, divert.FlagDefault)
+	if err != nil {
+		log.Fatalf("open forward handle: %v", err)
+	}
+	defer fwdH.Close()
+
+	revH, err := divert.Open(revFilter, divert.LayerNetwork, 0, divert.FlagDefault)
+	if err != nil {
+		log.Fatalf("open reverse handle: %v", err)
+	}
+	defer revH.Close()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	shutdownDone := make(chan struct{})
 	go func() {
+		defer close(shutdownDone)
 		<-ctx.Done()
 		log.Printf("signal received, cleaning up...")
+		_ = fwdH.Shutdown(divert.ShutdownBoth)
+		_ = revH.Shutdown(divert.ShutdownBoth)
 	}()
 
-	log.Printf("detour: %s — Ctrl+C to stop", rule)
+	var fwdCount, revCount atomic.Uint64
+	g, _ := errgroup.WithContext(ctx)
 
-	if err := r.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-		log.Printf("exit error: %v", err)
+	g.Go(func() error {
+		return runPath(fwdH, func(buf []byte) error {
+			return dnat.RewriteDest(buf, to.IP, to.Port)
+		}, &fwdCount, *verbose, "forward")
+	})
+	g.Go(func() error {
+		return runPath(revH, func(buf []byte) error {
+			return dnat.RewriteSrc(buf, from.IP, from.Port)
+		}, &revCount, *verbose, "reverse")
+	})
+
+	log.Printf("detour: %s -> %s (%s) — Ctrl+C to stop", from, to, proto)
+
+	werr := g.Wait()
+	<-shutdownDone
+
+	log.Printf("forward=%d reverse=%d packets", fwdCount.Load(), revCount.Load())
+	if werr != nil && !isShutdownErr(werr) && !errors.Is(werr, context.Canceled) {
+		log.Printf("exit error: %v", werr)
 		os.Exit(1)
+	}
+}
+
+// isShutdownErr matches the various WinDivert error codes that legitimately
+// surface when WinDivertShutdown unblocks a pending Recv: ERROR_NO_DATA when
+// the queue drains, ERROR_OPERATION_ABORTED when the I/O is cancelled, and
+// ERROR_INVALID_HANDLE if the handle is closed concurrently.
+func isShutdownErr(err error) bool {
+	return errors.Is(err, divert.ErrNoData) ||
+		errors.Is(err, divert.ErrOperationAborted) ||
+		errors.Is(err, divert.ErrInvalidHandle)
+}
+
+func runPath(h *divert.Handle, rw func([]byte) error, count *atomic.Uint64, verbose bool, name string) error {
+	buf := make([]byte, 65535)
+	var addr divert.Address
+	for {
+		n, err := h.Recv(buf, &addr)
+		if err != nil {
+			if isShutdownErr(err) {
+				if verbose {
+					log.Printf("%s: recv stopped (%v)", name, err)
+				}
+				return nil
+			}
+			return fmt.Errorf("%s recv: %w", name, err)
+		}
+		pkt := buf[:n]
+		if err := rw(pkt); err != nil {
+			if verbose {
+				log.Printf("%s: drop (rewrite failed: %v)", name, err)
+			}
+			continue
+		}
+		divert.CalcChecksums(pkt, &addr, 0)
+		if _, err := h.Send(pkt, &addr); err != nil {
+			if isShutdownErr(err) {
+				return nil
+			}
+			return fmt.Errorf("%s send: %w", name, err)
+		}
+		count.Add(1)
 	}
 }
