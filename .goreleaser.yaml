@@ -5,7 +5,8 @@ project_name: detour
 before:
   hooks:
     - go mod tidy
-    - go install github.com/tc-hib/go-winres@latest
+    # go-winres 자체는 release.yml(또는 로컬 빌드 환경)에서 사전 설치한다.
+    # PATH가 보장된 상태이므로 여기서는 호출만 한다.
     - go-winres make --arch amd64
 
 builds:

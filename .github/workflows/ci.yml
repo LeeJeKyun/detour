@@ -40,7 +40,9 @@ jobs:
           cache: true
 
       - name: Install go-winres
-        run: go install github.com/tc-hib/go-winres@latest
+        run: |
+          go install github.com/tc-hib/go-winres@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
       - name: Generate Windows resource (manifest + version info)
         run: go-winres make --arch amd64
