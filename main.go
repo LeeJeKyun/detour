@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	divert "github.com/imgk/divert-go"
 	"golang.org/x/sync/errgroup"
@@ -140,16 +141,28 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	var fwdCount, revCount atomic.Uint64
+
 	shutdownDone := make(chan struct{})
 	go func() {
 		defer close(shutdownDone)
 		<-ctx.Done()
-		log.Printf("signal received, cleaning up...")
+		log.Printf("signal received, cleaning up... (press Ctrl+C again to force exit)")
+		// Restore default Ctrl+C behavior so a second press kills the process
+		// immediately if WinDivertShutdown can't unblock pending Recv calls.
+		stop()
 		_ = fwdH.Shutdown(divert.ShutdownBoth)
 		_ = revH.Shutdown(divert.ShutdownBoth)
+		// Hard fallback: certain WinDivert versions / driver states don't
+		// reliably wake a blocked Recv on Shutdown. If g.Wait() hasn't
+		// returned within 3s, force exit so the user is never stuck.
+		time.AfterFunc(3*time.Second, func() {
+			log.Printf("cleanup timed out (forward=%d reverse=%d); forcing exit",
+				fwdCount.Load(), revCount.Load())
+			os.Exit(0)
+		})
 	}()
 
-	var fwdCount, revCount atomic.Uint64
 	g, _ := errgroup.WithContext(ctx)
 
 	g.Go(func() error {
