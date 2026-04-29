@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/lxn/walk"
@@ -83,9 +84,15 @@ func main() {
 		protoCB  *walk.ComboBox
 		startBtn *walk.PushButton
 		stopBtn  *walk.PushButton
+		countLb  *walk.Label
 		statusLb *walk.Label
+		ni       *walk.NotifyIcon
 	)
 	var ctrl runController
+
+	// tickerStop guards the polling goroutine for the currently active rule.
+	// It's recreated on each Start and closed in onDone to halt the goroutine.
+	var tickerStop chan struct{}
 
 	// setStatus / setRunning route widget mutation onto the GUI thread.
 	// walk widgets are not goroutine-safe; Synchronize() is the official escape
@@ -95,6 +102,17 @@ func main() {
 			return
 		}
 		mw.Synchronize(func() { _ = statusLb.SetText(s) })
+	}
+	setCounts := func(fwd, rev uint64) {
+		if mw == nil {
+			return
+		}
+		mw.Synchronize(func() {
+			_ = countLb.SetText(fmt.Sprintf("Forward: %d   Reverse: %d", fwd, rev))
+			if ni != nil {
+				_ = ni.SetToolTip(fmt.Sprintf("detour — fwd %d / rev %d", fwd, rev))
+			}
+		})
 	}
 	setRunning := func(running bool) {
 		if mw == nil {
@@ -149,18 +167,50 @@ func main() {
 
 		setRunning(true)
 		setStatus("Status: running — " + rule.String())
+		setCounts(0, 0)
+
+		// Atomic counters shared between runtime.Run (writer) and the
+		// polling goroutine below (reader). New atomics each Start so the
+		// counts visibly reset to 0 instead of carrying over.
+		fwdCnt := &atomic.Uint64{}
+		revCnt := &atomic.Uint64{}
+
+		tickerStop = make(chan struct{})
+		go func(stop <-chan struct{}, fwd, rev *atomic.Uint64) {
+			t := time.NewTicker(time.Second)
+			defer t.Stop()
+			for {
+				select {
+				case <-t.C:
+					setCounts(fwd.Load(), rev.Load())
+				case <-stop:
+					return
+				}
+			}
+		}(tickerStop, fwdCnt, revCnt)
 
 		started := ctrl.start(rule, runtime.Options{
+			ForwardCounter: fwdCnt,
+			ReverseCounter: revCnt,
 			OnStop: func(s runtime.Stats) {
+				setCounts(s.Forward, s.Reverse) // final value beats the next tick
 				setStatus(fmt.Sprintf("Status: stopped (forward=%d reverse=%d)", s.Forward, s.Reverse))
 			},
 		}, func(err error) {
+			if tickerStop != nil {
+				close(tickerStop)
+				tickerStop = nil
+			}
 			if err != nil && !errors.Is(err, context.Canceled) {
 				setStatus("Error: " + err.Error())
 			}
 			setRunning(false)
 		})
 		if !started {
+			if tickerStop != nil {
+				close(tickerStop)
+				tickerStop = nil
+			}
 			setStatus("Status: already running")
 		}
 	}
@@ -223,6 +273,10 @@ func main() {
 			},
 
 			Label{
+				AssignTo: &countLb,
+				Text:     "Forward: 0   Reverse: 0",
+			},
+			Label{
 				AssignTo: &statusLb,
 				Text:     statusIdle,
 			},
@@ -231,21 +285,39 @@ func main() {
 		log.Fatalf("create main window: %v", err)
 	}
 
-	// X button: hide to tray instead of exiting. The tray's Quit action is
-	// the only path that actually terminates the process.
-	mw.Closing().Attach(func(canceled *bool, reason walk.CloseReason) {
-		if reason == walk.CloseReasonUser {
-			*canceled = true
-			mw.Hide()
+	// X button (and Alt+F4): hide to tray instead of exiting. walk's
+	// CloseEvent always fires with CloseReasonUnknown because WM_CLOSE in
+	// form.go resets the reason before publish — so we can't filter by
+	// reason here. The tray's Quit action exits the process via
+	// walk.App().Exit(0), which doesn't go through this handler.
+	//
+	// firstHide forces a one-shot balloon the first time the user closes the
+	// window so they know the app is still running in the tray. Subsequent
+	// closes are silent.
+	var firstHide bool
+	mw.Closing().Attach(func(canceled *bool, _ walk.CloseReason) {
+		*canceled = true
+		mw.Hide()
+		if !firstHide {
+			firstHide = true
+			// niRef is set below after NotifyIcon is created. The closure
+			// captures it by reference via the outer ni variable.
+			if ni != nil {
+				_ = ni.ShowInfo(
+					"detour",
+					"Still running in the system tray.\nLeft-click the icon to reopen, or right-click → Quit to exit.",
+				)
+			}
 		}
 	})
 
 	mw.Show()
 	validateForm()
 
-	ni, err := walk.NewNotifyIcon(mw)
-	if err != nil {
-		log.Fatalf("create notify icon: %v", err)
+	var niErr error
+	ni, niErr = walk.NewNotifyIcon(mw)
+	if niErr != nil {
+		log.Fatalf("create notify icon: %v", niErr)
 	}
 	defer ni.Dispose()
 
