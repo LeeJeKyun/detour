@@ -1,19 +1,17 @@
 //go:build windows
 
-// Stage 3c: Start/Stop wired to runtime.Run via a runController. X button
-// minimizes to the tray; Quit triggers cancel + a brief grace period before
-// the process exits so WinDivert handles can drain.
+// Stage 4c: multi-rule GUI. The window is now a TableView of persisted
+// rules; each row carries its own engine, packet counters, and check-box
+// toggle. Rules persist to %APPDATA%/detour/rules.json automatically via
+// the rules.Store wrapped by manager.
 package main
 
 import (
-	"context"
-	"errors"
 	"fmt"
 	"image"
 	"image/color"
 	"log"
 	"os"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -22,332 +20,178 @@ import (
 
 	"detour/internal/cli"
 	"detour/internal/dnat"
-	"detour/internal/runtime"
-)
-
-const (
-	statusReady = "Status: ready"
-	statusIdle  = "Status: enter From and To to enable Start"
+	"detour/internal/rules"
 )
 
 var protoChoices = []string{"both", "tcp", "udp"}
 
-// runController owns the lifetime of a single runtime.Run invocation. start()
-// is non-blocking — it kicks off a goroutine and returns immediately. stop()
-// cancels the in-flight context; the actual teardown happens on the goroutine.
-type runController struct {
-	mu      sync.Mutex
-	cancel  context.CancelFunc
-	running bool
-}
-
-func (c *runController) start(rule runtime.Rule, opts runtime.Options, onDone func(error)) bool {
-	c.mu.Lock()
-	if c.running {
-		c.mu.Unlock()
-		return false
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	c.cancel = cancel
-	c.running = true
-	c.mu.Unlock()
-
-	go func() {
-		err := runtime.Run(ctx, rule, opts)
-		c.mu.Lock()
-		c.running = false
-		c.cancel = nil
-		c.mu.Unlock()
-		if onDone != nil {
-			onDone(err)
-		}
-	}()
-	return true
-}
-
-func (c *runController) stop() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.cancel != nil {
-		c.cancel()
-	}
-}
-
-func (c *runController) isRunning() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.running
-}
-
 func main() {
+	storePath, err := rules.DefaultPath()
+	if err != nil {
+		log.Fatalf("locate config dir: %v", err)
+	}
+	store := rules.NewStore(storePath)
+	if err := store.Load(); err != nil {
+		// Bad config file shouldn't keep the user out of the app — log it
+		// and start with an empty list. Once they Add a rule we'll
+		// overwrite the broken file with a clean one.
+		log.Printf("warning: failed to load %s: %v (starting empty)", storePath, err)
+	}
+	mgr := newManager(store)
+	mgr.LoadFromStore()
+
 	var (
 		mw       *walk.MainWindow
-		fromEdit *walk.LineEdit
-		toEdit   *walk.LineEdit
-		protoCB  *walk.ComboBox
-		startBtn *walk.PushButton
-		stopBtn  *walk.PushButton
-		countLb  *walk.Label
+		tv       *walk.TableView
+		editBtn  *walk.PushButton
+		delBtn   *walk.PushButton
 		statusLb *walk.Label
 		ni       *walk.NotifyIcon
 	)
-	var ctrl runController
-
-	// tickerStop guards the polling goroutine for the currently active rule.
-	// It's recreated on each Start and closed in onDone to halt the goroutine.
-	var tickerStop chan struct{}
-
-	// cleanupTimedOut becomes true once onStop's fallback decided to force
-	// exit. Kept as atomic so the X-button handler (GUI thread) and the
-	// fallback goroutine can race safely.
 	var cleanupTimedOut atomic.Bool
 
-	// Tray icons: one for idle, one for active. Built at runtime from solid
-	// color buffers — replace with .ico files or RT_GROUP_ICON for custom art.
-	idleIcon := makeSolidIcon(color.RGBA{R: 0x88, G: 0x88, B: 0x88, A: 0xff})   // gray
-	activeIcon := makeSolidIcon(color.RGBA{R: 0x3a, G: 0x9d, B: 0x6c, A: 0xff}) // green
+	// Tray icons: built at runtime from solid color buffers. Replace with
+	// real .ico art later if desired.
+	idleIcon := makeSolidIcon(color.RGBA{R: 0x88, G: 0x88, B: 0x88, A: 0xff})
+	activeIcon := makeSolidIcon(color.RGBA{R: 0x3a, G: 0x9d, B: 0x6c, A: 0xff})
 
-	// setStatus / setRunning route widget mutation onto the GUI thread.
-	// walk widgets are not goroutine-safe; Synchronize() is the official escape
-	// hatch for callbacks fired from runtime.Run's worker goroutines.
-	setStatus := func(s string) {
+	model := newRuleTableModel(mgr)
+
+	// refreshAll snapshots manager state and pushes it into every widget
+	// that depends on it: table model, status label, tray tooltip/icon,
+	// edit/delete button enabled state. Always invoked on the GUI thread.
+	refreshAll := func() {
 		if mw == nil {
 			return
 		}
-		mw.Synchronize(func() { _ = statusLb.SetText(s) })
+		model.refresh()
+		model.PublishRowsReset()
+		running, fwd, rev := mgr.AggregateCounts()
+		_ = statusLb.SetText(fmt.Sprintf("Active: %d   Forward: %d   Reverse: %d", running, fwd, rev))
+		if ni != nil {
+			_ = ni.SetToolTip(fmt.Sprintf("detour — %d active, fwd %d / rev %d", running, fwd, rev))
+			if running > 0 && activeIcon != nil {
+				_ = ni.SetIcon(activeIcon)
+			} else if idleIcon != nil {
+				_ = ni.SetIcon(idleIcon)
+			}
+		}
+		sel := tv.CurrentIndex()
+		editBtn.SetEnabled(sel >= 0)
+		delBtn.SetEnabled(sel >= 0)
 	}
-	setCounts := func(fwd, rev uint64) {
+
+	syncRefresh := func() {
 		if mw == nil {
 			return
 		}
-		mw.Synchronize(func() {
-			_ = countLb.SetText(fmt.Sprintf("Forward: %d   Reverse: %d", fwd, rev))
-			if ni != nil {
-				_ = ni.SetToolTip(fmt.Sprintf("detour — fwd %d / rev %d", fwd, rev))
-			}
-		})
+		mw.Synchronize(refreshAll)
 	}
-	setRunning := func(running bool) {
-		if mw == nil {
+	mgr.SetOnChanged(syncRefresh)
+
+	model.onCheck = func(id string, checked bool) {
+		var err error
+		if checked {
+			err = mgr.Start(id)
+		} else {
+			err = mgr.Stop(id)
+		}
+		if err != nil {
+			walk.MsgBox(mw, "detour", err.Error(), walk.MsgBoxIconWarning)
+		}
+	}
+
+	onAdd := func() {
+		r, ok := openRuleDialog(mw, rules.Rule{Proto: dnat.ProtoBoth}, "Add rule")
+		if !ok {
 			return
 		}
-		mw.Synchronize(func() {
-			fromEdit.SetEnabled(!running)
-			toEdit.SetEnabled(!running)
-			protoCB.SetEnabled(!running)
-			stopBtn.SetEnabled(running)
-			// Tray icon swaps with running state so the user can tell at a
-			// glance (gray = idle, green = active) without opening the window.
-			if ni != nil {
-				if running && activeIcon != nil {
-					_ = ni.SetIcon(activeIcon)
-				} else if !running && idleIcon != nil {
-					_ = ni.SetIcon(idleIcon)
-				}
-			}
-			if running {
-				startBtn.SetEnabled(false)
-				return
-			}
-			// idle: re-evaluate Start based on current input validity
-			_, errFrom := cli.ParseEndpoint(fromEdit.Text())
-			_, errTo := cli.ParseEndpoint(toEdit.Text())
-			startBtn.SetEnabled(errFrom == nil && errTo == nil)
-		})
+		if _, err := mgr.Add(r); err != nil {
+			walk.MsgBox(mw, "detour — add failed", err.Error(), walk.MsgBoxIconError)
+		}
 	}
-
-	// Live validation runs on every keystroke, but only when no rule is active.
-	validateForm := func() {
-		if fromEdit == nil || toEdit == nil || statusLb == nil || startBtn == nil {
+	onEdit := func() {
+		id := model.rowID(tv.CurrentIndex())
+		if id == "" {
 			return
 		}
-		if ctrl.isRunning() {
+		r, err := store.Get(id)
+		if err != nil {
 			return
 		}
-		_, errFrom := cli.ParseEndpoint(fromEdit.Text())
-		_, errTo := cli.ParseEndpoint(toEdit.Text())
-		switch {
-		case errFrom != nil && fromEdit.Text() != "":
-			_ = statusLb.SetText("From: " + errFrom.Error())
-		case errTo != nil && toEdit.Text() != "":
-			_ = statusLb.SetText("To: " + errTo.Error())
-		case errFrom == nil && errTo == nil:
-			_ = statusLb.SetText(statusReady)
-		default:
-			_ = statusLb.SetText(statusIdle)
+		edited, ok := openRuleDialog(mw, r, "Edit rule")
+		if !ok {
+			return
 		}
-		startBtn.SetEnabled(errFrom == nil && errTo == nil)
-	}
-
-	onStart := func() {
-		from, errFrom := cli.ParseEndpoint(fromEdit.Text())
-		to, errTo := cli.ParseEndpoint(toEdit.Text())
-		if errFrom != nil || errTo != nil {
-			return // shouldn't happen — Start is disabled until both validate
-		}
-		rule := runtime.Rule{From: from, To: to, Proto: chosenProto(protoCB)}
-
-		setRunning(true)
-		setStatus("Status: running — " + rule.String())
-		setCounts(0, 0)
-
-		// Atomic counters shared between runtime.Run (writer) and the
-		// polling goroutine below (reader). New atomics each Start so the
-		// counts visibly reset to 0 instead of carrying over.
-		fwdCnt := &atomic.Uint64{}
-		revCnt := &atomic.Uint64{}
-
-		tickerStop = make(chan struct{})
-		go func(stop <-chan struct{}, fwd, rev *atomic.Uint64) {
-			t := time.NewTicker(time.Second)
-			defer t.Stop()
-			for {
-				select {
-				case <-t.C:
-					setCounts(fwd.Load(), rev.Load())
-				case <-stop:
-					return
-				}
-			}
-		}(tickerStop, fwdCnt, revCnt)
-
-		started := ctrl.start(rule, runtime.Options{
-			ForwardCounter: fwdCnt,
-			ReverseCounter: revCnt,
-			OnStop: func(s runtime.Stats) {
-				setCounts(s.Forward, s.Reverse) // final value beats the next tick
-				setStatus(fmt.Sprintf("Status: stopped (forward=%d reverse=%d)", s.Forward, s.Reverse))
-			},
-		}, func(err error) {
-			if tickerStop != nil {
-				close(tickerStop)
-				tickerStop = nil
-			}
-			if err != nil && !errors.Is(err, context.Canceled) {
-				setStatus("Error: " + err.Error())
-			}
-			setRunning(false)
-		})
-		if !started {
-			if tickerStop != nil {
-				close(tickerStop)
-				tickerStop = nil
-			}
-			setStatus("Status: already running")
+		edited.ID = id
+		if err := mgr.Update(edited); err != nil {
+			walk.MsgBox(mw, "detour — edit failed", err.Error(), walk.MsgBoxIconError)
 		}
 	}
-
-	onStop := func() {
-		setStatus("Status: stopping...")
-		stopBtn.SetEnabled(false)
-		ctrl.stop()
-
-		// Fallback: if runtime.Run can't drain within 3s (rare WinDivert
-		// quirk where Shutdown fails to wake a blocked Recv), force the
-		// process to exit so the user is never trapped in "stopping..." with
-		// no way to recover. Use os.Exit instead of walk.App().Exit because
-		// the latter posts WM_QUIT to the message loop — if the loop is
-		// wedged, the quit message never gets handled. os.Exit is OS-level
-		// and always terminates the process.
-		go func() {
-			time.Sleep(3 * time.Second)
-			if ctrl.isRunning() {
-				cleanupTimedOut.Store(true)
-				mw.Synchronize(func() {
-					_ = statusLb.SetText("Status: cleanup timed out — exiting")
-				})
-				time.Sleep(300 * time.Millisecond)
-				os.Exit(0)
-			}
-		}()
+	onDelete := func() {
+		id := model.rowID(tv.CurrentIndex())
+		if id == "" {
+			return
+		}
+		if walk.MsgBox(mw, "detour", "Delete this rule?", walk.MsgBoxYesNo|walk.MsgBoxIconQuestion) != walk.DlgCmdYes {
+			return
+		}
+		if err := mgr.Remove(id); err != nil {
+			walk.MsgBox(mw, "detour — delete failed", err.Error(), walk.MsgBoxIconError)
+		}
 	}
 
 	if err := (MainWindow{
 		AssignTo: &mw,
 		Title:    "detour",
-		Size:     Size{Width: 480, Height: 280},
+		Size:     Size{Width: 760, Height: 360},
 		Layout:   VBox{Margins: Margins{Left: 12, Top: 12, Right: 12, Bottom: 12}, Spacing: 8},
 		Children: []Widget{
-			Composite{
-				Layout: Grid{Columns: 2, Spacing: 8},
-				Children: []Widget{
-					Label{Text: "From (IP:Port):"},
-					LineEdit{
-						AssignTo:      &fromEdit,
-						CueBanner:     "1.2.3.4:5000",
-						OnTextChanged: validateForm,
-					},
-
-					Label{Text: "To (IP:Port):"},
-					LineEdit{
-						AssignTo:      &toEdit,
-						CueBanner:     "127.0.0.1:5001",
-						OnTextChanged: validateForm,
-					},
-
-					Label{Text: "Protocol:"},
-					ComboBox{
-						AssignTo:     &protoCB,
-						Model:        protoChoices,
-						CurrentIndex: 0,
-					},
+			TableView{
+				AssignTo:         &tv,
+				AlternatingRowBG: true,
+				CheckBoxes:       true,
+				Columns: []TableViewColumn{
+					{Title: "•", Width: 28, Alignment: AlignCenter},
+					{Title: "From", Width: 150},
+					{Title: "To", Width: 150},
+					{Title: "Proto", Width: 60},
+					{Title: "Forward", Width: 80, Alignment: AlignFar},
+					{Title: "Reverse", Width: 80, Alignment: AlignFar},
+					{Title: "Status", Width: 110},
 				},
+				Model: model,
+				OnCurrentIndexChanged: func() {
+					sel := tv.CurrentIndex()
+					editBtn.SetEnabled(sel >= 0)
+					delBtn.SetEnabled(sel >= 0)
+				},
+				OnItemActivated: onEdit,
 			},
-
 			Composite{
 				Layout: HBox{Spacing: 8},
 				Children: []Widget{
-					PushButton{
-						AssignTo:  &startBtn,
-						Text:      "Start",
-						Enabled:   false,
-						OnClicked: onStart,
-					},
-					PushButton{
-						AssignTo:  &stopBtn,
-						Text:      "Stop",
-						Enabled:   false,
-						OnClicked: onStop,
-					},
+					PushButton{Text: "Add", OnClicked: onAdd},
+					PushButton{AssignTo: &editBtn, Text: "Edit", Enabled: false, OnClicked: onEdit},
+					PushButton{AssignTo: &delBtn, Text: "Delete", Enabled: false, OnClicked: onDelete},
 					HSpacer{},
+					Label{AssignTo: &statusLb, Text: "Active: 0   Forward: 0   Reverse: 0"},
 				},
-			},
-
-			Label{
-				AssignTo: &countLb,
-				Text:     "Forward: 0   Reverse: 0",
-			},
-			Label{
-				AssignTo: &statusLb,
-				Text:     statusIdle,
 			},
 		},
 	}).Create(); err != nil {
 		log.Fatalf("create main window: %v", err)
 	}
 
-	// X button (and Alt+F4) policy:
-	//   - rule actively running → hide to tray (rule keeps applying; tray
-	//     icon is the only visible affordance)
-	//   - idle (no rule running) → actually exit. Once the user has clicked
-	//     Stop and the rule is down, X means "I'm done with this app."
-	//   - cleanupTimedOut → exit immediately rather than wait the 300ms
-	//     courtesy delay in onStop's fallback.
-	//
-	// walk's CloseEvent always fires with CloseReasonUnknown (WM_CLOSE in
-	// form.go resets the reason before publish), so we can't tell X from
-	// Alt+F4 from a programmatic close — same policy applies to all.
-	//
-	// firstHide forces a one-shot balloon the first time we hide so the user
-	// knows the app is still alive in the tray. Subsequent hides are silent.
+	// X-button policy: any rule running → hide to tray (rules keep
+	// running, the tray icon is the only visible affordance). Idle →
+	// actually exit. cleanupTimedOut → bypass walk's message loop.
 	var firstHide bool
 	mw.Closing().Attach(func(canceled *bool, _ walk.CloseReason) {
 		if cleanupTimedOut.Load() {
-			// Cleanup is already wedged — bypass walk's message loop.
 			os.Exit(0)
 		}
-		if !ctrl.isRunning() {
-			// Idle: graceful walk shutdown is fine here.
+		if !mgr.AnyRunning() {
 			walk.App().Exit(0)
 			return
 		}
@@ -365,7 +209,6 @@ func main() {
 	})
 
 	mw.Show()
-	validateForm()
 
 	var niErr error
 	ni, niErr = walk.NewNotifyIcon(mw)
@@ -373,13 +216,10 @@ func main() {
 		log.Fatalf("create notify icon: %v", niErr)
 	}
 	defer ni.Dispose()
-
 	_ = ni.SetToolTip("detour")
 	if idleIcon != nil {
 		_ = ni.SetIcon(idleIcon)
 	}
-
-	// Left-click on the tray icon brings the main window back.
 	ni.MouseDown().Attach(func(_, _ int, button walk.MouseButton) {
 		if button == walk.LeftButton {
 			mw.Show()
@@ -398,37 +238,152 @@ func main() {
 	quitAction := walk.NewAction()
 	_ = quitAction.SetText("Quit")
 	quitAction.Triggered().Attach(func() {
-		// Cancel the running rule, then give WinDivert a moment to release
-		// its driver handles before the process exits. 500ms is in line with
-		// the CLI's 3s ceiling but tuned for snappier GUI shutdown.
-		ctrl.stop()
-		if ctrl.isRunning() {
-			time.Sleep(500 * time.Millisecond)
+		// Stop everything, then poll briefly until all engines drain.
+		// Each engine has its own 1-second force-close inside runtime.Run,
+		// so 3 seconds is plenty under normal conditions; if a wedged
+		// handle pushes us past the deadline we force-exit so the user is
+		// never stuck.
+		mgr.StopAll()
+		deadline := time.Now().Add(3 * time.Second)
+		for mgr.AnyRunning() {
+			if time.Now().After(deadline) {
+				cleanupTimedOut.Store(true)
+				os.Exit(0)
+			}
+			time.Sleep(50 * time.Millisecond)
 		}
 		walk.App().Exit(0)
 	})
 	_ = ni.ContextMenu().Actions().Add(quitAction)
-
 	_ = ni.SetVisible(true)
 
+	// 1s polling loop refreshes packet counts. Manager events already
+	// handle add/remove/start/stop transitions immediately; this just
+	// surfaces atomic counter ticks.
+	pollStop := make(chan struct{})
+	go func() {
+		t := time.NewTicker(time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-t.C:
+				syncRefresh()
+			case <-pollStop:
+				return
+			}
+		}
+	}()
+	defer close(pollStop)
+
+	refreshAll()
 	mw.Run()
 }
 
-// chosenProto turns the protocol combo box selection into a dnat.Protocol.
-func chosenProto(cb *walk.ComboBox) dnat.Protocol {
-	switch cb.CurrentIndex() {
-	case 1:
-		return dnat.ProtoTCP
-	case 2:
-		return dnat.ProtoUDP
-	default:
-		return dnat.ProtoBoth
+// openRuleDialog shows a modal form to capture/edit a rule. Returns the
+// resulting Rule and true on OK; (zero, false) on Cancel or invalid input.
+// initial seeds the fields — pass a zero Rule for Add.
+func openRuleDialog(parent walk.Form, initial rules.Rule, title string) (rules.Rule, bool) {
+	var (
+		dlg       *walk.Dialog
+		fromEdit  *walk.LineEdit
+		toEdit    *walk.LineEdit
+		protoCB   *walk.ComboBox
+		okBtn     *walk.PushButton
+		cancelBtn *walk.PushButton
+		errLb     *walk.Label
+	)
+	initialFrom, initialTo := "", ""
+	if initial.From.IP != nil {
+		initialFrom = initial.From.String()
 	}
+	if initial.To.IP != nil {
+		initialTo = initial.To.String()
+	}
+	initialProto := 0
+	switch initial.Proto {
+	case dnat.ProtoTCP:
+		initialProto = 1
+	case dnat.ProtoUDP:
+		initialProto = 2
+	}
+
+	var resultRule rules.Rule
+	var ok bool
+
+	validate := func() {
+		from := fromEdit.Text()
+		to := toEdit.Text()
+		_, errFrom := cli.ParseEndpoint(from)
+		_, errTo := cli.ParseEndpoint(to)
+		switch {
+		case errFrom != nil && from != "":
+			_ = errLb.SetText("From: " + errFrom.Error())
+		case errTo != nil && to != "":
+			_ = errLb.SetText("To: " + errTo.Error())
+		default:
+			_ = errLb.SetText("")
+		}
+		okBtn.SetEnabled(errFrom == nil && errTo == nil)
+	}
+
+	onOK := func() {
+		from, errFrom := cli.ParseEndpoint(fromEdit.Text())
+		to, errTo := cli.ParseEndpoint(toEdit.Text())
+		if errFrom != nil || errTo != nil {
+			return
+		}
+		proto := dnat.ProtoBoth
+		switch protoCB.CurrentIndex() {
+		case 1:
+			proto = dnat.ProtoTCP
+		case 2:
+			proto = dnat.ProtoUDP
+		}
+		resultRule = rules.Rule{From: from, To: to, Proto: proto}
+		ok = true
+		dlg.Accept()
+	}
+
+	if err := (Dialog{
+		AssignTo:      &dlg,
+		Title:         title,
+		DefaultButton: &okBtn,
+		CancelButton:  &cancelBtn,
+		MinSize:       Size{Width: 360, Height: 200},
+		Layout:        VBox{Margins: Margins{Left: 12, Top: 12, Right: 12, Bottom: 12}, Spacing: 8},
+		Children: []Widget{
+			Composite{
+				Layout: Grid{Columns: 2, Spacing: 8},
+				Children: []Widget{
+					Label{Text: "From (IP:Port):"},
+					LineEdit{AssignTo: &fromEdit, Text: initialFrom, OnTextChanged: validate, CueBanner: "1.2.3.4:5000"},
+					Label{Text: "To (IP:Port):"},
+					LineEdit{AssignTo: &toEdit, Text: initialTo, OnTextChanged: validate, CueBanner: "127.0.0.1:5001"},
+					Label{Text: "Protocol:"},
+					ComboBox{AssignTo: &protoCB, Model: protoChoices, CurrentIndex: initialProto},
+				},
+			},
+			Label{AssignTo: &errLb, Text: ""},
+			Composite{
+				Layout: HBox{Spacing: 8},
+				Children: []Widget{
+					HSpacer{},
+					PushButton{AssignTo: &okBtn, Text: "OK", OnClicked: onOK},
+					PushButton{AssignTo: &cancelBtn, Text: "Cancel", OnClicked: func() { dlg.Cancel() }},
+				},
+			},
+		},
+	}).Create(parent); err != nil {
+		return rules.Rule{}, false
+	}
+	validate()
+	dlg.Run()
+	return resultRule, ok
 }
 
-// makeSolidIcon builds a 16x16 single-color tray icon at runtime. Avoids the
-// hassle of shipping .ico files; users wanting a custom design can replace
-// the call sites with walk.NewIconFromFile / RT_GROUP_ICON later.
+// makeSolidIcon builds a 16x16 single-color tray icon at runtime. Avoids
+// the hassle of shipping .ico files; users wanting a custom design can
+// replace the call sites with walk.NewIconFromFile / RT_GROUP_ICON.
 func makeSolidIcon(c color.Color) *walk.Icon {
 	const size = 16
 	img := image.NewRGBA(image.Rect(0, 0, size, size))
@@ -439,7 +394,6 @@ func makeSolidIcon(c color.Color) *walk.Icon {
 	}
 	icon, err := walk.NewIconFromImage(img)
 	if err != nil {
-		// On failure fall back to no icon — the tray will draw a placeholder.
 		return nil
 	}
 	return icon

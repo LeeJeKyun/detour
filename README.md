@@ -67,21 +67,24 @@ Press `Ctrl+C` to stop. Both WinDivert handles close cleanly and traffic returns
 
 ### GUI — `detour-gui.exe`
 
-A small native window for users who prefer not to keep an Administrator console open. Double-click to launch — the same UAC prompt appears, then a window with `From` / `To` / `Protocol` fields and Start / Stop buttons.
+A small native window for users who prefer not to keep an Administrator console open. Double-click to launch — the same UAC prompt appears, then a window listing your saved rules in a table.
 
 Behavior:
-- **Live packet counts** (`Forward: N   Reverse: N`) refresh every second while a rule is active.
-- **Tray icon** in the system notification area — hover to see the same counts as a tooltip; left-click to reopen the window; right-click for **Open / Quit**.
-- **Closing the window** with the X button (or Alt+F4) hides to the tray instead of exiting; only **Quit** terminates the process. The first time you close, a balloon notification reminds you the app is still running.
-- Inputs are validated live; **Start** stays disabled until both `From` and `To` parse as valid IPv4:Port.
+- **Multi-rule** — every row is an independent rule with its own packet counters. Toggle the leftmost checkbox to start/stop a single rule; multiple rules can run at the same time.
+- **Add / Edit / Delete** buttons (or double-click a row to edit) open a small modal dialog with `From` / `To` / `Protocol` fields. Inputs are validated live; **OK** stays disabled until both endpoints parse as valid IPv4:Port. A rule must be stopped before it can be edited.
+- **Auto-saved** to `%APPDATA%\detour\rules.json`. Every Add/Edit/Delete writes the file atomically; the next launch restores the same list.
+- **Live packet counts** (`Forward` / `Reverse`) refresh every second per row, plus a footer aggregate (`Active: N   Forward: M   Reverse: M`).
+- **Tray icon** in the system notification area — gray when idle, green when at least one rule is running. Hover for the aggregate tooltip; left-click to reopen the window; right-click for **Open / Quit**.
+- **Closing the window** with the X button (or Alt+F4) hides to the tray as long as any rule is running; only **Quit** (or X with everything stopped) terminates the process. The first hide triggers a balloon notification so you know the app is still alive.
+- **Conflict detection** — two rules with the same `From IP:Port` and overlapping protocols (e.g. one `tcp`, another `both`) are rejected at Add/Edit time so the WinDivert filters never fight.
 
-The CLI and GUI share the same packet-handling core (`internal/runtime`), so behavior with respect to traffic is identical — choose whichever interface is more convenient.
+The CLI and GUI share the same packet-handling core (`internal/runtime`), so per-rule behavior with respect to traffic is identical — choose whichever interface is more convenient.
 
 ## How it works
 
 - **Forward handle**: receives outbound packets matching `ip.DstAddr == FROM_IP` + `DstPort == FROM_PORT`, rewrites the destination to `TO`, recalculates checksums, and reinjects the packet.
 - **Reverse handle**: receives inbound packets matching `ip.SrcAddr == TO_IP` + `SrcPort == TO_PORT`, rewrites the source back to `FROM`, so the calling application sees responses as coming from the address it originally dialed.
-- Applies system-wide (no PID filtering). One `--from`/`--to` rule per process — run multiple instances for multiple rules.
+- Applies system-wide (no PID filtering). The CLI runs one rule per process; the GUI multiplexes multiple rules within a single process, each with its own pair of WinDivert handles.
 
 ## Runtime layout
 
