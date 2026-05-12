@@ -147,6 +147,14 @@ func (m *ruleTableModel) SelectedSnapshots() []engineSnapshot {
 // unchecked, every row becomes checked; if every row is already
 // checked, the selection clears. Wired to the column-0 header click so
 // users can mass-select before pressing Start/Stop/Delete.
+//
+// PublishRowsReset (fired transitively via onSelectionChanged →
+// refreshAll) doesn't reliably re-push LVIS_STATEIMAGEMASK to already-
+// rendered rows in walk's CheckBoxes mode — visible rows keep the
+// stale checkbox visual until each one repaints on hover. Explicitly
+// emitting RowsChanged(0, last) makes walk invalidate each item and
+// re-query Checked() during the next paint, so every checkbox updates
+// immediately.
 func (m *ruleTableModel) ToggleAllSelected() {
 	if len(m.rows) == 0 {
 		return
@@ -159,6 +167,7 @@ func (m *ruleTableModel) ToggleAllSelected() {
 			delete(m.selected, r.Rule.ID)
 		}
 	}
+	m.PublishRowsChanged(0, len(m.rows)-1)
 	if m.onSelectionChanged != nil {
 		m.onSelectionChanged()
 	}
