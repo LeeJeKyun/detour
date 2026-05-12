@@ -21,27 +21,47 @@ const (
 // ruleTableModel binds the manager to a walk.TableView. The model holds a
 // snapshot taken at refresh time so cell rendering doesn't fight manager
 // locks per Value() call. ItemChecker turns the leftmost column into a
-// row-level Start/Stop toggle.
+// row-selection checkbox — actual Start/Stop happens via footer buttons
+// that act on the currently checked rows.
 type ruleTableModel struct {
 	walk.TableModelBase
 	mgr  *manager
 	rows []engineSnapshot
 
-	// onCheck is invoked when the user toggles an Active checkbox. Wired
-	// from main.go to manager.Start / manager.Stop on the GUI thread.
-	onCheck func(id string, checked bool)
+	// selected tracks which rule IDs have their row checkbox ticked.
+	// Survives PublishRowsReset because walk re-queries Checked() from
+	// this map after the reset.
+	selected map[string]bool
+
+	// onSelectionChanged fires after the user toggles a checkbox so the
+	// GUI can recompute Start/Stop/Edit/Delete enabled state. Invoked on
+	// the GUI thread (SetChecked is a walk message-loop callback).
+	onSelectionChanged func()
 }
 
 func newRuleTableModel(mgr *manager) *ruleTableModel {
-	m := &ruleTableModel{mgr: mgr}
+	m := &ruleTableModel{mgr: mgr, selected: map[string]bool{}}
 	m.refresh()
 	return m
 }
 
 // refresh re-reads from the manager. Call from the GUI thread before
-// PublishRowsReset so the table picks up the new snapshot.
+// PublishRowsReset so the table picks up the new snapshot. Also prunes
+// stale entries from `selected` for rules that were removed.
 func (m *ruleTableModel) refresh() {
 	m.rows = m.mgr.SnapshotAll()
+	if len(m.selected) == 0 {
+		return
+	}
+	live := make(map[string]struct{}, len(m.rows))
+	for _, r := range m.rows {
+		live[r.Rule.ID] = struct{}{}
+	}
+	for id := range m.selected {
+		if _, ok := live[id]; !ok {
+			delete(m.selected, id)
+		}
+	}
 }
 
 func (m *ruleTableModel) RowCount() int {
@@ -83,32 +103,59 @@ func (m *ruleTableModel) Value(row, col int) interface{} {
 	return ""
 }
 
-// Checked / SetChecked satisfy walk.ItemChecker. Toggling the box on a
-// row hands the rule ID to onCheck so the manager can start/stop the
-// engine; the model itself does not mutate state directly.
+// Checked / SetChecked satisfy walk.ItemChecker. The checkbox now
+// represents row selection — it does NOT start or stop the engine
+// directly. Start/Stop happens via the footer buttons, which read
+// SelectedSnapshots() and act in bulk.
 func (m *ruleTableModel) Checked(index int) bool {
 	if index < 0 || index >= len(m.rows) {
 		return false
 	}
-	s := m.rows[index].State
-	return s == engineRunning || s == engineStopping
+	return m.selected[m.rows[index].Rule.ID]
 }
 
 func (m *ruleTableModel) SetChecked(index int, checked bool) error {
 	if index < 0 || index >= len(m.rows) {
 		return nil
 	}
-	if m.onCheck == nil {
-		return nil
-	}
 	id := m.rows[index].Rule.ID
-	m.onCheck(id, checked)
+	if checked {
+		m.selected[id] = true
+	} else {
+		delete(m.selected, id)
+	}
+	if m.onSelectionChanged != nil {
+		m.onSelectionChanged()
+	}
 	return nil
 }
 
+// SelectedSnapshots returns the snapshots of all currently checked
+// rows, preserving display order. Button handlers use this to decide
+// which engines to Start/Stop and to gate Edit (single selection only).
+func (m *ruleTableModel) SelectedSnapshots() []engineSnapshot {
+	var out []engineSnapshot
+	for _, r := range m.rows {
+		if m.selected[r.Rule.ID] {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// snapshotByID looks up the cached snapshot for a rule ID. Used by the
+// double-click handler to skip Edit on running rules.
+func (m *ruleTableModel) snapshotByID(id string) (engineSnapshot, bool) {
+	for _, r := range m.rows {
+		if r.Rule.ID == id {
+			return r, true
+		}
+	}
+	return engineSnapshot{}, false
+}
+
 // rowID returns the rule ID at the given row, or "" if out of range.
-// Callers (Edit/Delete buttons) use this to map a selected row back to
-// the manager.
+// Used by the double-click activation handler.
 func (m *ruleTableModel) rowID(row int) string {
 	if row < 0 || row >= len(m.rows) {
 		return ""

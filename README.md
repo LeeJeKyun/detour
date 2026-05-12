@@ -70,8 +70,9 @@ Press `Ctrl+C` to stop. Both WinDivert handles close cleanly and traffic returns
 A small native window for users who prefer not to keep an Administrator console open. Double-click to launch — the same UAC prompt appears, then a window listing your saved rules in a table.
 
 Behavior:
-- **Multi-rule** — every row is an independent rule with its own packet counters. Toggle the leftmost checkbox to start/stop a single rule; multiple rules can run at the same time.
-- **Add / Edit / Delete** buttons (or double-click a row to edit) open a small modal dialog with `From` / `To` / `Protocol` fields. Inputs are validated live; **OK** stays disabled until both endpoints parse as valid IPv4:Port. A rule must be stopped before it can be edited.
+- **Multi-rule** — every row is an independent rule with its own packet counters; multiple rules can run at the same time.
+- **Checkbox = selection, buttons = action.** Tick the leftmost checkbox on one or more rows, then press **Start** / **Stop** in the footer to activate or deactivate the checked rules. Edit applies to a single checked row; Delete works on any number of checked rows. Button enable state is driven by the checkboxes, not row focus — clicking around the table to tick boxes never disables Edit or Delete.
+- **Add / Edit / Delete** open a small modal dialog with `From` / `To` / `Protocol` fields. Inputs are validated live; **OK** stays disabled until both endpoints parse as valid IPv4:Port. A rule must be stopped before it can be edited. Double-clicking a row is a shortcut for editing that specific row.
 - **Auto-saved** to `%APPDATA%\detour\rules.json`. Every Add/Edit/Delete writes the file atomically; the next launch restores the same list.
 - **Live packet counts** (`Forward` / `Reverse`) refresh every second per row, plus a footer aggregate (`Active: N   Forward: M   Reverse: M`).
 - **Tray icon** in the system notification area — gray when idle, green when at least one rule is running. Hover for the aggregate tooltip; left-click to reopen the window; right-click for **Open / Quit**.

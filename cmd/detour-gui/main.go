@@ -43,6 +43,8 @@ func main() {
 	var (
 		mw       *walk.MainWindow
 		tv       *walk.TableView
+		startBtn *walk.PushButton
+		stopBtn  *walk.PushButton
 		editBtn  *walk.PushButton
 		delBtn   *walk.PushButton
 		statusLb *walk.Label
@@ -59,7 +61,9 @@ func main() {
 
 	// refreshAll snapshots manager state and pushes it into every widget
 	// that depends on it: table model, status label, tray tooltip/icon,
-	// edit/delete button enabled state. Always invoked on the GUI thread.
+	// and the Start/Stop/Edit/Delete button enabled state. Always invoked
+	// on the GUI thread. Button enable is now driven by checkbox state,
+	// not row focus, so clicking around the table doesn't disable Edit.
 	refreshAll := func() {
 		if mw == nil {
 			return
@@ -76,9 +80,20 @@ func main() {
 				_ = ni.SetIcon(idleIcon)
 			}
 		}
-		sel := tv.CurrentIndex()
-		editBtn.SetEnabled(sel >= 0)
-		delBtn.SetEnabled(sel >= 0)
+		sels := model.SelectedSnapshots()
+		var anyIdle, anyRunning bool
+		for _, s := range sels {
+			if s.State == engineRunning || s.State == engineStopping {
+				anyRunning = true
+			} else {
+				anyIdle = true
+			}
+		}
+		startBtn.SetEnabled(anyIdle)
+		stopBtn.SetEnabled(anyRunning)
+		// Edit: exactly one selected AND not running (Update rejects running rules).
+		editBtn.SetEnabled(len(sels) == 1 && !anyRunning)
+		delBtn.SetEnabled(len(sels) >= 1)
 	}
 
 	syncRefresh := func() {
@@ -89,17 +104,9 @@ func main() {
 	}
 	mgr.SetOnChanged(syncRefresh)
 
-	model.onCheck = func(id string, checked bool) {
-		var err error
-		if checked {
-			err = mgr.Start(id)
-		} else {
-			err = mgr.Stop(id)
-		}
-		if err != nil {
-			walk.MsgBox(mw, "detour", err.Error(), walk.MsgBoxIconWarning)
-		}
-	}
+	// Checkbox toggles are pure selection — no engine state changes.
+	// Recompute footer button enable states whenever selection moves.
+	model.onSelectionChanged = refreshAll
 
 	onAdd := func() {
 		r, ok := openRuleDialog(mw, rules.Rule{Proto: dnat.ProtoBoth}, "Add rule")
@@ -110,9 +117,12 @@ func main() {
 			walk.MsgBox(mw, "detour — add failed", err.Error(), walk.MsgBoxIconError)
 		}
 	}
-	onEdit := func() {
-		id := model.rowID(tv.CurrentIndex())
-		if id == "" {
+	// editByID opens the dialog for a single rule and applies the change.
+	// Refuses to edit a running rule (manager.Update would reject anyway,
+	// but we'd rather not waste the user's typing).
+	editByID := func(id string) {
+		if s, ok := model.snapshotByID(id); ok && (s.State == engineRunning || s.State == engineStopping) {
+			walk.MsgBox(mw, "detour", "Stop the rule before editing.", walk.MsgBoxIconInformation)
 			return
 		}
 		r, err := store.Get(id)
@@ -128,16 +138,61 @@ func main() {
 			walk.MsgBox(mw, "detour — edit failed", err.Error(), walk.MsgBoxIconError)
 		}
 	}
-	onDelete := func() {
+	onEdit := func() {
+		sels := model.SelectedSnapshots()
+		if len(sels) != 1 {
+			return
+		}
+		editByID(sels[0].Rule.ID)
+	}
+	// Double-clicking a row is an explicit gesture, so we let it edit that
+	// row regardless of checkbox state.
+	onActivate := func() {
 		id := model.rowID(tv.CurrentIndex())
 		if id == "" {
 			return
 		}
-		if walk.MsgBox(mw, "detour", "Delete this rule?", walk.MsgBoxYesNo|walk.MsgBoxIconQuestion) != walk.DlgCmdYes {
+		editByID(id)
+	}
+	onDelete := func() {
+		sels := model.SelectedSnapshots()
+		if len(sels) == 0 {
 			return
 		}
-		if err := mgr.Remove(id); err != nil {
-			walk.MsgBox(mw, "detour — delete failed", err.Error(), walk.MsgBoxIconError)
+		msg := "Delete this rule?"
+		if len(sels) > 1 {
+			msg = fmt.Sprintf("Delete %d rules?", len(sels))
+		}
+		if walk.MsgBox(mw, "detour", msg, walk.MsgBoxYesNo|walk.MsgBoxIconQuestion) != walk.DlgCmdYes {
+			return
+		}
+		for _, s := range sels {
+			if err := mgr.Remove(s.Rule.ID); err != nil {
+				walk.MsgBox(mw, "detour — delete failed", err.Error(), walk.MsgBoxIconError)
+				return
+			}
+		}
+	}
+	onStart := func() {
+		for _, s := range model.SelectedSnapshots() {
+			if s.State == engineRunning || s.State == engineStopping {
+				continue
+			}
+			if err := mgr.Start(s.Rule.ID); err != nil {
+				walk.MsgBox(mw, "detour — start failed", err.Error(), walk.MsgBoxIconWarning)
+				return
+			}
+		}
+	}
+	onStop := func() {
+		for _, s := range model.SelectedSnapshots() {
+			if s.State != engineRunning && s.State != engineStopping {
+				continue
+			}
+			if err := mgr.Stop(s.Rule.ID); err != nil {
+				walk.MsgBox(mw, "detour — stop failed", err.Error(), walk.MsgBoxIconWarning)
+				return
+			}
 		}
 	}
 
@@ -160,17 +215,14 @@ func main() {
 					{Title: "Reverse", Width: 80, Alignment: AlignFar},
 					{Title: "Status", Width: 110},
 				},
-				Model: model,
-				OnCurrentIndexChanged: func() {
-					sel := tv.CurrentIndex()
-					editBtn.SetEnabled(sel >= 0)
-					delBtn.SetEnabled(sel >= 0)
-				},
-				OnItemActivated: onEdit,
+				Model:           model,
+				OnItemActivated: onActivate,
 			},
 			Composite{
 				Layout: HBox{Spacing: 8},
 				Children: []Widget{
+					PushButton{AssignTo: &startBtn, Text: "Start", Enabled: false, OnClicked: onStart},
+					PushButton{AssignTo: &stopBtn, Text: "Stop", Enabled: false, OnClicked: onStop},
 					PushButton{Text: "Add", OnClicked: onAdd},
 					PushButton{AssignTo: &editBtn, Text: "Edit", Enabled: false, OnClicked: onEdit},
 					PushButton{AssignTo: &delBtn, Text: "Delete", Enabled: false, OnClicked: onDelete},
