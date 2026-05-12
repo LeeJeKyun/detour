@@ -143,6 +143,27 @@ func (m *ruleTableModel) SelectedSnapshots() []engineSnapshot {
 	return out
 }
 
+// ToggleAllSelected flips the selection state en masse. If any row is
+// unchecked, every row becomes checked; if every row is already
+// checked, the selection clears. Wired to the column-0 header click so
+// users can mass-select before pressing Start/Stop/Delete.
+func (m *ruleTableModel) ToggleAllSelected() {
+	if len(m.rows) == 0 {
+		return
+	}
+	target := len(m.SelectedSnapshots()) < len(m.rows)
+	for _, r := range m.rows {
+		if target {
+			m.selected[r.Rule.ID] = true
+		} else {
+			delete(m.selected, r.Rule.ID)
+		}
+	}
+	if m.onSelectionChanged != nil {
+		m.onSelectionChanged()
+	}
+}
+
 // snapshotByID looks up the cached snapshot for a rule ID. Used by the
 // double-click handler to skip Edit on running rules.
 func (m *ruleTableModel) snapshotByID(id string) (engineSnapshot, bool) {

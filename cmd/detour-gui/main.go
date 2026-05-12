@@ -207,7 +207,7 @@ func main() {
 				AlternatingRowBG: true,
 				CheckBoxes:       true,
 				Columns: []TableViewColumn{
-					{Title: "•", Width: 28, Alignment: AlignCenter},
+					{Title: "All", Width: 36, Alignment: AlignCenter},
 					{Title: "From", Width: 150},
 					{Title: "To", Width: 150},
 					{Title: "Proto", Width: 60},
@@ -234,6 +234,14 @@ func main() {
 	}).Create(); err != nil {
 		log.Fatalf("create main window: %v", err)
 	}
+
+	// Clicking the "All" column header toggles every row's checkbox.
+	// Other column headers are no-ops (sorting isn't enabled).
+	tv.ColumnClicked().Attach(func(col int) {
+		if col == colActive {
+			model.ToggleAllSelected()
+		}
+	})
 
 	// X-button policy: any rule running → hide to tray (rules keep
 	// running, the tray icon is the only visible affordance). Idle →
